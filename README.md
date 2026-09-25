@@ -44,19 +44,15 @@
 
 ## 📁 โครงสร้างโปรเจกต์
 
-```
-project/
-├── server/                    ← รันบน PC1
-│   ├── server.py              # Discord Bot + HTTP Server
-│   ├── requirements.txt
-│   └── .env                   # BOT_TOKEN, API_SECRET
-│
-├── client/                    ← รันบน PC2
-│   ├── client.py              # Poll + Capture + Send
-│   └── requirements.txt
-│
-├── .gitignore
-└── README.md
+```         
+    ├── server.py   ← รันบน PC1
+    ├── requirements.txt
+    └── .env                   # BOT_TOKEN, API_SECRET
+                 
+  ├── client.py     ← รันบน PC2         # Poll + Capture + Send
+  └── requirements.txt
+  ├── .gitignore
+  └── README.md
 ```
 
 ---
